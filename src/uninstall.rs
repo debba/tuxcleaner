@@ -608,11 +608,20 @@ fn parse_tab_detail_map(stdout: &str, size_multiplier: u64) -> HashMap<String, (
         .collect()
 }
 
+/// Parses a human-readable size such as `441.3 MB` into bytes.
+///
+/// Everything that is not a digit, a decimal point, or a unit letter is
+/// dropped before parsing. Discarding only whitespace is not enough: package
+/// managers separate the number from its unit with a non-breaking space, and
+/// commands are deliberately run under `LC_ALL=C` (see `ProcessCommandRunner`)
+/// so their output is stable to parse. Under that locale GLib cannot encode
+/// U+00A0 and transliterates it to a literal `?`, which is not whitespace, so
+/// `flatpak list` reports `14.8?MB` and every size used to parse as zero.
 fn parse_reported_size(value: &str) -> u64 {
     let normalized: String = value
         .replace(',', ".")
         .chars()
-        .filter(|character| !character.is_whitespace())
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '.')
         .collect();
     let upper = normalized.to_ascii_uppercase();
     for (suffix, multiplier) in [
@@ -905,5 +914,25 @@ mod tests {
         assert!(is_protected_package("linux-image-amd64"));
         assert!(!is_protected_package("firefox"));
         assert_eq!(parse_reported_size("441.3\u{a0}MB"), 441_300_000);
+    }
+
+    #[test]
+    fn reported_sizes_survive_the_c_locale_transliterating_the_unit_separator() {
+        // Commands run under LC_ALL=C, where GLib cannot encode the U+00A0
+        // separator and emits a literal `?` instead. Every one of these spellings
+        // describes the same size and must parse identically.
+        assert_eq!(parse_reported_size("14.8?MB"), 14_800_000);
+        assert_eq!(parse_reported_size("14.8\u{a0}MB"), 14_800_000);
+        assert_eq!(parse_reported_size("14.8 MB"), 14_800_000);
+        assert_eq!(parse_reported_size("14.8MB"), 14_800_000);
+        // Narrow no-break and thin spaces appear in other locales.
+        assert_eq!(parse_reported_size("14.8\u{202f}MB"), 14_800_000);
+        assert_eq!(parse_reported_size("14.8\u{2009}MB"), 14_800_000);
+        // Comma decimal separators still work alongside the substitution.
+        assert_eq!(parse_reported_size("441,3?MB"), 441_300_000);
+        assert_eq!(parse_reported_size("1.5?GB"), 1_500_000_000);
+        // Unparseable input must stay at zero rather than guessing.
+        assert_eq!(parse_reported_size("?"), 0);
+        assert_eq!(parse_reported_size(""), 0);
     }
 }
