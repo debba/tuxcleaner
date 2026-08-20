@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -23,7 +23,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::analyze::{AnalysisReport, DiskEntry, LargeFile, analyze_cancellable};
+use crate::analyze::{DiskEntry, LargeFile, ScanUpdate, spawn_streaming_scan};
 use crate::distro::Distribution;
 use crate::executor::{CommandRunner, Executor};
 use crate::history::{HistoryRecord, HistoryStore};
@@ -43,6 +43,16 @@ use view::*;
 
 const ANALYZE_MINIMUM_SIZE: u64 = 500_000_000;
 const ANALYZE_MAX_DEPTH: usize = 20;
+/// Number of ancestor levels (above the active location) that are allowed to keep a live
+/// background scan running. The plan's "N" — with the active location included, up to
+/// `ANALYZE_LIVE_SCAN_DEPTH + 1` levels may hold a live handle at once.
+const ANALYZE_LIVE_SCAN_DEPTH: usize = 2;
+const ANALYZE_LIVE_SCAN_CAP: usize = ANALYZE_LIVE_SCAN_DEPTH + 1;
+/// How often the active location's display order is rebuilt from live data.
+const ANALYZE_REORDER_INTERVAL: Duration = Duration::from_millis(400);
+/// Upper bound on `ScanUpdate` messages drained per location per poll tick, so a very chatty
+/// scan can never starve the UI thread.
+const ANALYZE_MAX_UPDATES_PER_TICK: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
@@ -186,20 +196,217 @@ enum AnalyzeMode {
     TopFiles,
 }
 
-struct LocationSnapshot {
+/// A live streaming scan in progress for one `Location`.
+struct ScanHandle {
+    receiver: Receiver<ScanUpdate>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl ScanHandle {
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// One level of the drill-down stack. The last entry in `AnalyzeState::locations` is the
+/// currently displayed ("active") location; earlier entries are ancestors that may still have a
+/// live background scan draining (up to `ANALYZE_LIVE_SCAN_CAP`), preserving whatever partial
+/// data they gathered so Back does not force a re-scan.
+struct Location {
     path: PathBuf,
-    report: AnalysisReport,
-    selected: Option<usize>,
+    /// Backing store keyed by top-level child path, upserted on every `Progress` update.
+    entries: BTreeMap<PathBuf, DiskEntry>,
+    /// The cumulative file count last reported for each top-level child, kept alongside
+    /// `entries` so incoming (cumulative) `Progress` updates can be turned into deltas for the
+    /// running `total_files` counter.
+    bucket_files: BTreeMap<PathBuf, u64>,
+    /// Displayed order, rebuilt from `entries` at most every `ANALYZE_REORDER_INTERVAL`.
+    sorted: Vec<DiskEntry>,
+    large_files: Vec<LargeFile>,
+    total_size: u64,
+    total_files: u64,
+    skipped: u64,
+    /// Selection tracked by path identity rather than list index, so a background re-sort can
+    /// never cause the cursor (or an Enter keypress) to silently jump to a different row.
+    selected: Option<PathBuf>,
+    last_reorder: Instant,
+    complete: bool,
+    error: Option<String>,
+    /// Set whenever `entries`/`large_files` change or the location becomes active again;
+    /// cleared once `reorder` runs. Lets `poll` reorder promptly on completion or activation
+    /// without waiting out the throttle interval.
+    needs_reorder: bool,
+    scan: Option<ScanHandle>,
+}
+
+impl Location {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            entries: BTreeMap::new(),
+            bucket_files: BTreeMap::new(),
+            sorted: Vec::new(),
+            large_files: Vec::new(),
+            total_size: 0,
+            total_files: 0,
+            skipped: 0,
+            selected: None,
+            last_reorder: Instant::now(),
+            complete: false,
+            error: None,
+            needs_reorder: true,
+            scan: None,
+        }
+    }
+
+    fn has_data(&self) -> bool {
+        !self.entries.is_empty() || !self.large_files.is_empty()
+    }
+
+    fn start_scan(&mut self) {
+        self.cancel_scan();
+        let (receiver, cancel) =
+            spawn_streaming_scan(self.path.clone(), ANALYZE_MINIMUM_SIZE, ANALYZE_MAX_DEPTH);
+        self.entries.clear();
+        self.bucket_files.clear();
+        self.sorted.clear();
+        self.large_files.clear();
+        self.total_size = 0;
+        self.total_files = 0;
+        self.skipped = 0;
+        self.selected = None;
+        self.complete = false;
+        self.error = None;
+        self.needs_reorder = true;
+        self.scan = Some(ScanHandle { receiver, cancel });
+    }
+
+    fn cancel_scan(&mut self) {
+        if let Some(handle) = self.scan.take() {
+            handle.cancel();
+        }
+    }
+
+    fn apply_progress(&mut self, top: PathBuf, size: u64, files: u64, is_dir: bool) {
+        let name = top
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| top.display().to_string());
+        let previous_size = self.entries.get(&top).map_or(0, |entry| entry.size);
+        let previous_files = self.bucket_files.get(&top).copied().unwrap_or(0);
+        self.total_size = self
+            .total_size
+            .saturating_sub(previous_size)
+            .saturating_add(size);
+        self.total_files = self
+            .total_files
+            .saturating_sub(previous_files)
+            .saturating_add(files);
+        self.bucket_files.insert(top.clone(), files);
+        self.entries.insert(
+            top.clone(),
+            DiskEntry {
+                name,
+                path: top,
+                size,
+                is_dir,
+            },
+        );
+        self.needs_reorder = true;
+    }
+
+    fn reorder(&mut self) {
+        let (sorted, selected) =
+            reorder_and_reconcile(&self.entries, &self.sorted, self.selected.as_deref());
+        self.sorted = sorted;
+        self.selected = selected;
+        self.last_reorder = Instant::now();
+        self.needs_reorder = false;
+    }
+}
+
+/// Pure, unit-testable core of the reorder/reconcile step: rebuilds the size-desc (name
+/// tie-break) display order from the backing map, then resolves the identity-tracked selection
+/// against the new order. If the previously selected path is still present, it stays selected
+/// regardless of where it moved to. If it vanished, the same position in the previous order is
+/// used as a stable fallback; if there was no previous order either, the first row is selected.
+fn reorder_and_reconcile(
+    entries: &BTreeMap<PathBuf, DiskEntry>,
+    previous_sorted: &[DiskEntry],
+    selected: Option<&Path>,
+) -> (Vec<DiskEntry>, Option<PathBuf>) {
+    let mut sorted: Vec<DiskEntry> = entries.values().cloned().collect();
+    sorted.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
+
+    let resolved = match selected {
+        Some(path) if sorted.iter().any(|entry| entry.path == path) => Some(path.to_path_buf()),
+        Some(path) => previous_sorted
+            .iter()
+            .position(|entry| entry.path == path)
+            .and_then(|index| sorted.get(index))
+            .map(|entry| entry.path.clone())
+            .or_else(|| sorted.first().map(|entry| entry.path.clone())),
+        None => sorted.first().map(|entry| entry.path.clone()),
+    };
+
+    (sorted, resolved)
+}
+
+/// Drains a bounded number of pending updates for one location's live scan (if any), updating
+/// its accumulated data. Never treats a plain disconnect as an error: the streaming protocol
+/// always sends an explicit `Done` (or `Error`) before the sender is dropped, so an observed
+/// disconnect with neither seen this tick just means the scan was cancelled (e.g. evicted by the
+/// depth cap) and is not a user-facing failure.
+fn drain_location(location: &mut Location) {
+    let Some(handle) = location.scan.take() else {
+        return;
+    };
+    let mut budget = ANALYZE_MAX_UPDATES_PER_TICK;
+    loop {
+        if budget == 0 {
+            location.scan = Some(handle);
+            return;
+        }
+        match handle.receiver.try_recv() {
+            Ok(ScanUpdate::Progress {
+                top,
+                size,
+                files,
+                is_dir,
+            }) => location.apply_progress(top, size, files, is_dir),
+            Ok(ScanUpdate::Large(file)) => location.large_files.push(file),
+            Ok(ScanUpdate::Skipped(skipped)) => location.skipped = skipped,
+            Ok(ScanUpdate::Done {
+                total_size,
+                total_files,
+                skipped,
+            }) => {
+                location.total_size = total_size;
+                location.total_files = total_files;
+                location.skipped = skipped;
+                location.complete = true;
+                location.needs_reorder = true;
+                return;
+            }
+            Ok(ScanUpdate::Error(error)) => {
+                location.error = Some(error);
+                location.complete = true;
+                return;
+            }
+            Err(TryRecvError::Empty) => {
+                location.scan = Some(handle);
+                return;
+            }
+            Err(TryRecvError::Disconnected) => return,
+        }
+        budget -= 1;
+    }
 }
 
 struct AnalyzeState {
     home: PathBuf,
-    path: PathBuf,
-    report: Option<AnalysisReport>,
-    scan: Option<Receiver<Result<AnalysisReport, String>>>,
-    scan_cancel: Option<Arc<AtomicBool>>,
-    scan_error: Option<String>,
-    navigation: Vec<LocationSnapshot>,
+    /// Drill-down stack; the last entry is the active (displayed) location.
+    locations: Vec<Location>,
     mode: AnalyzeMode,
     list_state: ListState,
     selected_files: BTreeMap<PathBuf, u64>,
@@ -226,7 +433,7 @@ impl App {
     fn poll(&mut self) {
         match &mut self.screen {
             Screen::Analyze(analyze) => {
-                analyze.poll_scan();
+                analyze.poll();
                 analyze.spinner = (analyze.spinner + 1) % 4;
             }
             Screen::Workflow(workflow) => {
@@ -306,11 +513,12 @@ impl App {
                     KeyCode::Char('t') => analyze.toggle_mode(),
                     KeyCode::Char('/') => analyze.begin_filter(),
                     KeyCode::Char('r') => analyze.refresh(),
-                    KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
-                        if analyze.clear_filter_or_go_back() {
-                            self.screen = Screen::Home;
-                        }
+                    KeyCode::Esc | KeyCode::Left | KeyCode::Char('h')
+                        if analyze.clear_filter_or_go_back() =>
+                    {
+                        self.screen = Screen::Home;
                     }
+                    KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {}
                     _ => {}
                 }
             }
@@ -610,14 +818,11 @@ impl WorkflowState {
 
 impl AnalyzeState {
     fn new(home: PathBuf) -> Self {
-        let mut state = Self {
-            path: home.clone(),
+        let mut root = Location::new(home.clone());
+        root.start_scan();
+        Self {
             home,
-            report: None,
-            scan: None,
-            scan_cancel: None,
-            scan_error: None,
-            navigation: Vec::new(),
+            locations: vec![root],
             mode: AnalyzeMode::Browse,
             list_state: ListState::default(),
             selected_files: BTreeMap::new(),
@@ -630,113 +835,115 @@ impl AnalyzeState {
             show_help: false,
             spinner: 0,
             history_store: HistoryStore::system_default().ok(),
+        }
+    }
+
+    fn active(&self) -> &Location {
+        self.locations.last().expect("at least one location")
+    }
+
+    fn active_mut(&mut self) -> &mut Location {
+        self.locations.last_mut().expect("at least one location")
+    }
+
+    fn active_has_data(&self) -> bool {
+        self.active().has_data()
+    }
+
+    /// Drains every location's pending scan updates, then rebuilds the active location's display
+    /// order (and reconciles `list_state` to it) whenever the throttle interval elapsed or the
+    /// active location's data just changed (including finishing, or having just been revealed).
+    fn poll(&mut self) {
+        for location in &mut self.locations {
+            drain_location(location);
+        }
+        let index = self.locations.len() - 1;
+        let should_reorder = {
+            let active = &self.locations[index];
+            active.needs_reorder || active.last_reorder.elapsed() >= ANALYZE_REORDER_INTERVAL
         };
-        state.start_scan();
-        state
+        if should_reorder {
+            self.locations[index].reorder();
+            self.reconcile_list_state();
+        }
     }
 
-    fn start_scan(&mut self) {
-        self.cancel_scan();
-        let path = self.path.clone();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let worker_cancelled = Arc::clone(&cancelled);
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let result = analyze_cancellable(
-                &path,
-                ANALYZE_MINIMUM_SIZE,
-                ANALYZE_MAX_DEPTH,
-                &worker_cancelled,
-            )
-            .map_err(|error| format!("{error:#}"));
-            let _ = sender.send(result);
-        });
-        self.report = None;
-        self.scan = Some(receiver);
-        self.scan_cancel = Some(cancelled);
-        self.scan_error = None;
-        self.list_state.select(None);
-        self.status = "Scanning disk usage...".into();
-    }
-
-    fn poll_scan(&mut self) {
-        let Some(receiver) = &self.scan else {
+    /// Syncs `list_state`'s numeric index to the active location's identity-tracked selection.
+    /// Only meaningful in `Browse` mode: in `TopFiles` mode `list_state` indexes into
+    /// `large_files`, an unrelated collection that background directory scanning never touches.
+    fn reconcile_list_state(&mut self) {
+        if self.mode != AnalyzeMode::Browse {
             return;
+        }
+        let selected_path = self.active().selected.clone();
+        let (index, resolved_path) = {
+            let visible = self.visible_entries();
+            let index = selected_path
+                .as_deref()
+                .and_then(|path| visible.iter().position(|entry| entry.path == path))
+                .or((!visible.is_empty()).then_some(0));
+            let resolved_path = index
+                .and_then(|index| visible.get(index))
+                .map(|entry| entry.path.clone());
+            (index, resolved_path)
         };
-        match receiver.try_recv() {
-            Ok(Ok(report)) => {
-                let count = report.entries.len();
-                self.status = format!(
-                    "Scanned {} across {} files",
-                    format_bytes(report.total_size),
-                    report.total_files
-                );
-                self.report = Some(report);
-                self.scan = None;
-                self.scan_cancel = None;
-                self.select_first_if_available(count);
-            }
-            Ok(Err(error)) => {
-                self.scan_error = Some(error);
-                self.scan = None;
-                self.scan_cancel = None;
-                self.status = "Scan failed".into();
-            }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                self.scan_error = Some("disk scan stopped unexpectedly".into());
-                self.scan = None;
-                self.scan_cancel = None;
-                self.status = "Scan failed".into();
-            }
+        self.list_state.select(index);
+        if let Some(path) = resolved_path {
+            self.active_mut().selected = Some(path);
         }
     }
 
     fn select_first_if_available(&mut self, count: usize) {
-        self.list_state.select((count > 0).then_some(0));
+        if count == 0 {
+            self.list_state.select(None);
+            return;
+        }
+        self.list_state.select(Some(0));
+        if self.mode == AnalyzeMode::Browse {
+            if let Some(path) = self
+                .visible_entries()
+                .first()
+                .map(|entry| entry.path.clone())
+            {
+                self.active_mut().selected = Some(path);
+            }
+        }
     }
 
     fn visible_entries(&self) -> Vec<&DiskEntry> {
         let query = self.filter.to_ascii_lowercase();
-        self.report
-            .as_ref()
-            .map(|report| {
-                report
-                    .entries
-                    .iter()
-                    .filter(|entry| {
-                        query.is_empty()
-                            || entry.name.to_ascii_lowercase().contains(&query)
-                            || entry
-                                .path
-                                .to_string_lossy()
-                                .to_ascii_lowercase()
-                                .contains(&query)
-                    })
-                    .collect()
+        self.active()
+            .sorted
+            .iter()
+            .filter(|entry| {
+                query.is_empty()
+                    || entry.name.to_ascii_lowercase().contains(&query)
+                    || entry
+                        .path
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .contains(&query)
             })
-            .unwrap_or_default()
+            .collect()
     }
 
     fn visible_large_files(&self) -> Vec<&LargeFile> {
         let query = self.filter.to_ascii_lowercase();
-        self.report
-            .as_ref()
-            .map(|report| {
-                report
-                    .large_files
-                    .iter()
-                    .filter(|file| {
-                        query.is_empty()
-                            || file
-                                .path
-                                .to_string_lossy()
-                                .to_ascii_lowercase()
-                                .contains(&query)
-                    })
-                    .collect()
+        let mut files: Vec<&LargeFile> = self
+            .active()
+            .large_files
+            .iter()
+            .filter(|file| {
+                query.is_empty()
+                    || file
+                        .path
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .contains(&query)
             })
-            .unwrap_or_default()
+            .collect();
+        files.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
+        files
     }
 
     fn visible_len(&self) -> usize {
@@ -759,34 +966,66 @@ impl AnalyzeState {
             (current + 1).min(length - 1)
         };
         self.list_state.select(Some(next));
+        if self.mode == AnalyzeMode::Browse {
+            if let Some(path) = self
+                .visible_entries()
+                .get(next)
+                .map(|entry| entry.path.clone())
+            {
+                self.active_mut().selected = Some(path);
+            }
+        }
     }
 
     fn enter_selected(&mut self) {
-        if self.mode == AnalyzeMode::TopFiles || self.scan.is_some() {
+        if self.mode == AnalyzeMode::TopFiles {
             return;
         }
-        let Some(index) = self.list_state.selected() else {
+        // `selected` is `None` until the first entry has streamed in and been reconciled, so
+        // this alone blocks entering before there is anything to enter -- no separate "scan
+        // still running" guard is needed. Reading it directly (rather than indexing through
+        // `list_state`/`sorted`) keeps this immune to a reorder landing in the same tick.
+        let Some(target) = self.active().selected.clone() else {
             return;
         };
-        let Some(entry) = self.visible_entries().get(index).copied() else {
+        let Some(entry) = self.active().entries.get(&target).cloned() else {
             return;
         };
         if !entry.is_dir {
             self.status = "Use Space to select the file, then d to remove it".into();
             return;
         }
-        let next_path = entry.path.clone();
-        let selected = self.list_state.selected();
-        if let Some(report) = self.report.take() {
-            self.navigation.push(LocationSnapshot {
-                path: self.path.clone(),
-                report,
-                selected,
-            });
-        }
-        self.path = next_path;
+        self.push_location(entry.path);
+    }
+
+    fn push_location(&mut self, path: PathBuf) {
+        let mut location = Location::new(path);
+        location.start_scan();
+        self.locations.push(location);
+        self.enforce_scan_depth_cap();
         self.filter.clear();
-        self.start_scan();
+        self.filtering = false;
+        self.selected_files.clear();
+        self.list_state = ListState::default();
+        self.status = "Scanning disk usage...".into();
+    }
+
+    /// Keeps at most `ANALYZE_LIVE_SCAN_CAP` locations with a live scan handle at once, evicting
+    /// the oldest ancestor first. Eviction only cancels the handle; whatever data that location
+    /// already gathered is kept, so revisiting it later still shows partial/complete results
+    /// instead of an empty screen.
+    fn enforce_scan_depth_cap(&mut self) {
+        let mut live: Vec<usize> = self
+            .locations
+            .iter()
+            .enumerate()
+            .filter(|(_, location)| location.scan.is_some())
+            .map(|(index, _)| index)
+            .collect();
+        while live.len() > ANALYZE_LIVE_SCAN_CAP {
+            let oldest = live.remove(0);
+            self.locations[oldest].cancel_scan();
+        }
     }
 
     fn focused_file(&self) -> Option<(PathBuf, u64)> {
@@ -806,8 +1045,8 @@ impl AnalyzeState {
     }
 
     fn toggle_selection(&mut self) {
-        if self.scan.is_some() {
-            self.status = "Selection is available after the scan finishes".into();
+        if !self.active_has_data() {
+            self.status = "Selection is available once items appear".into();
             return;
         }
         let Some((path, size)) = self.focused_file() else {
@@ -821,8 +1060,8 @@ impl AnalyzeState {
     }
 
     fn begin_delete(&mut self) {
-        if self.scan.is_some() {
-            self.status = "Removal is available after the scan finishes".into();
+        if !self.active_has_data() {
+            self.status = "Removal is available once items appear".into();
             return;
         }
         self.pending_delete = if self.selected_files.is_empty() {
@@ -872,16 +1111,15 @@ impl AnalyzeState {
         self.pending_delete.clear();
         self.selected_files.clear();
         self.results = Some(results);
-        self.start_scan();
+        self.active_mut().start_scan();
+        self.list_state = ListState::default();
+        self.status = "Scanning disk usage...".into();
     }
 
     fn update_selection_status(&mut self) {
         let total: u64 = self.selected_files.values().sum();
         self.status = if self.selected_files.is_empty() {
-            self.report
-                .as_ref()
-                .map(|report| format!("Scanned {}", format_bytes(report.total_size)))
-                .unwrap_or_default()
+            format!("Scanned {}", format_bytes(self.active().total_size))
         } else {
             format!(
                 "{} selected, {}",
@@ -892,7 +1130,7 @@ impl AnalyzeState {
     }
 
     fn toggle_mode(&mut self) {
-        if self.scan.is_some() {
+        if !self.active_has_data() {
             return;
         }
         self.mode = match self.mode {
@@ -911,7 +1149,7 @@ impl AnalyzeState {
     }
 
     fn begin_filter(&mut self) {
-        if self.report.is_some() {
+        if self.active_has_data() {
             self.filtering = true;
             self.selected_files.clear();
             self.status = "Type to filter, Enter to apply, Esc to clear".into();
@@ -946,13 +1184,16 @@ impl AnalyzeState {
             self.toggle_mode();
             return false;
         }
-        if let Some(snapshot) = self.navigation.pop() {
-            self.cancel_scan();
-            self.path = snapshot.path;
-            self.report = Some(snapshot.report);
-            self.scan = None;
-            self.scan_error = None;
-            self.list_state = ListState::default().with_selected(snapshot.selected);
+        if self.locations.len() > 1 {
+            // Deliberately does not cancel the popped location's scan: the plan intends
+            // ancestors to keep draining in the background (up to the depth cap) precisely so
+            // Back can reveal further-along or complete data instead of forcing a re-scan. Only
+            // depth-cap eviction (see `enforce_scan_depth_cap`) ever cancels a handle.
+            self.locations.pop();
+            self.selected_files.clear();
+            self.list_state = ListState::default();
+            self.active_mut().reorder();
+            self.reconcile_list_state();
             self.status = "Returned to previous location".into();
             return false;
         }
@@ -960,25 +1201,20 @@ impl AnalyzeState {
     }
 
     fn refresh(&mut self) {
-        if self.scan.is_some() {
+        if self.active().scan.is_some() {
             self.status = "A scan is already in progress".into();
             return;
         }
         self.filter.clear();
         self.filtering = false;
         self.selected_files.clear();
-        self.start_scan();
-    }
-
-    fn cancel_scan(&mut self) {
-        if let Some(cancelled) = self.scan_cancel.take() {
-            cancelled.store(true, Ordering::Relaxed);
-        }
-        self.scan = None;
+        self.active_mut().start_scan();
+        self.list_state = ListState::default();
+        self.status = "Scanning disk usage...".into();
     }
 
     fn render_items(&self) -> Vec<ListItem<'static>> {
-        let total = self.report.as_ref().map_or(0, |report| report.total_size);
+        let total = self.active().total_size;
         match self.mode {
             AnalyzeMode::Browse => self
                 .visible_entries()
@@ -1010,7 +1246,9 @@ impl AnalyzeState {
 
 impl Drop for AnalyzeState {
     fn drop(&mut self) {
-        self.cancel_scan();
+        for location in &mut self.locations {
+            location.cancel_scan();
+        }
     }
 }
 
@@ -1107,31 +1345,29 @@ mod tests {
 
     fn ready_analyze(home: &Path, file: PathBuf) -> AnalyzeState {
         let size = fs::metadata(&file).unwrap().len();
+        let mut location = Location::new(home.to_path_buf());
+        let entry = DiskEntry {
+            name: file.file_name().unwrap().to_string_lossy().into_owned(),
+            path: file.clone(),
+            size,
+            is_dir: false,
+        };
+        location.entries.insert(file.clone(), entry.clone());
+        location.sorted = vec![entry];
+        location.large_files = vec![LargeFile {
+            path: file.clone(),
+            size,
+            modified_unix: None,
+            app_data: false,
+        }];
+        location.total_size = size;
+        location.total_files = 1;
+        location.complete = true;
+        location.needs_reorder = false;
+        location.selected = Some(file);
         AnalyzeState {
             home: home.to_path_buf(),
-            path: home.to_path_buf(),
-            report: Some(AnalysisReport {
-                root: home.to_path_buf(),
-                entries: vec![DiskEntry {
-                    name: file.file_name().unwrap().to_string_lossy().into_owned(),
-                    path: file.clone(),
-                    size,
-                    is_dir: false,
-                }],
-                large_files: vec![LargeFile {
-                    path: file,
-                    size,
-                    modified_unix: None,
-                    app_data: false,
-                }],
-                total_size: size,
-                total_files: 1,
-                skipped_entries: 0,
-            }),
-            scan: None,
-            scan_cancel: None,
-            scan_error: None,
-            navigation: Vec::new(),
+            locations: vec![location],
             mode: AnalyzeMode::Browse,
             list_state: ListState::default().with_selected(Some(0)),
             selected_files: BTreeMap::new(),
@@ -1243,7 +1479,7 @@ mod tests {
     fn entering_analyze_renders_loading_immediately_and_escape_cancels_scan() {
         let root = tempdir().unwrap();
         let state = AnalyzeState::new(root.path().to_path_buf());
-        let cancelled = Arc::clone(state.scan_cancel.as_ref().unwrap());
+        let cancelled = Arc::clone(&state.locations[0].scan.as_ref().unwrap().cancel);
         let mut app = App::new(root.path().to_path_buf());
         app.screen = Screen::Analyze(Box::new(state));
         let backend = TestBackend::new(80, 24);
@@ -1359,5 +1595,55 @@ mod tests {
         assert!(cleanup_action_requires_root(&direct));
         assert!(cleanup_action_requires_root(&sequence));
         assert!(!cleanup_action_requires_root(&personal));
+    }
+
+    fn entry(name: &str, size: u64) -> DiskEntry {
+        DiskEntry {
+            name: name.into(),
+            path: PathBuf::from(format!("/root/{name}")),
+            size,
+            is_dir: true,
+        }
+    }
+
+    #[test]
+    fn reorder_keeps_cursor_on_the_same_path_after_a_size_change() {
+        let mut entries = BTreeMap::new();
+        entries.insert(PathBuf::from("/root/a"), entry("a", 10));
+        entries.insert(PathBuf::from("/root/b"), entry("b", 5));
+        let previous_sorted = vec![entry("a", 10), entry("b", 5)];
+
+        // "b" was the smaller entry and thus ranked last, but it is still the selected path.
+        let selected = Some(Path::new("/root/b"));
+        let (sorted, resolved) = reorder_and_reconcile(&entries, &previous_sorted, selected);
+        assert_eq!(sorted[1].path, PathBuf::from("/root/b"));
+        assert_eq!(resolved, Some(PathBuf::from("/root/b")));
+
+        // Now "b" grows past "a": the display order flips, but the resolved selection must stay
+        // on "b" by identity rather than silently tracking whatever is now in the old slot.
+        let mut grown = BTreeMap::new();
+        grown.insert(PathBuf::from("/root/a"), entry("a", 10));
+        grown.insert(PathBuf::from("/root/b"), entry("b", 50));
+        let (sorted, resolved) = reorder_and_reconcile(&grown, &sorted, resolved.as_deref());
+        assert_eq!(sorted[0].path, PathBuf::from("/root/b"));
+        assert_eq!(resolved, Some(PathBuf::from("/root/b")));
+    }
+
+    #[test]
+    fn enter_targets_the_selected_path_even_after_a_same_tick_reorder() {
+        let mut entries = BTreeMap::new();
+        entries.insert(PathBuf::from("/root/a"), entry("a", 1));
+        entries.insert(PathBuf::from("/root/b"), entry("b", 100));
+        entries.insert(PathBuf::from("/root/c"), entry("c", 2));
+        let previous_sorted = vec![entry("b", 100), entry("c", 2), entry("a", 1)];
+
+        // The cursor was resting on "c" right before a reorder lands in the same tick.
+        let (sorted, resolved) =
+            reorder_and_reconcile(&entries, &previous_sorted, Some(Path::new("/root/c")));
+
+        // Regardless of where "c" ends up in the freshly sorted list, `enter_selected` must be
+        // able to resolve the exact same directory that was under the cursor.
+        assert_eq!(resolved, Some(PathBuf::from("/root/c")));
+        assert!(sorted.iter().any(|item| item.path == Path::new("/root/c")));
     }
 }

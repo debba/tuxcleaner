@@ -482,8 +482,23 @@ pub(super) fn draw_analyze(frame: &mut Frame<'_>, state: &mut AnalyzeState) {
             Constraint::Length(4),
         ])
         .split(frame.area());
-    let title = match &state.report {
-        Some(report) => vec![
+    // Extract everything needed from the active location up front, as owned/copy values, so no
+    // borrow of `state.locations` is held live across the later `&mut state.list_state` use.
+    let path_display = state.active().path.display().to_string();
+    let total_size = state.active().total_size;
+    let total_files = state.active().total_files;
+    let has_data = state.active_has_data();
+    let complete = state.active().complete;
+    let is_scanning = state.active().scan.is_some();
+    let error = state.active().error.clone();
+
+    let title = if has_data {
+        let suffix = if is_scanning && !complete {
+            " (scanning…)"
+        } else {
+            ""
+        };
+        vec![
             Line::from(Span::styled(
                 "TuxCleaner › Analyze",
                 Style::default()
@@ -491,21 +506,20 @@ pub(super) fn draw_analyze(frame: &mut Frame<'_>, state: &mut AnalyzeState) {
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(format!(
-                "{}  ·  {} across {} files",
-                state.path.display(),
-                format_bytes(report.total_size),
-                report.total_files
+                "{path_display}  ·  {} across {total_files} files{suffix}",
+                format_bytes(total_size),
             )),
-        ],
-        None => vec![
+        ]
+    } else {
+        vec![
             Line::from(Span::styled(
                 "TuxCleaner › Analyze",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from(state.path.display().to_string()),
-        ],
+            Line::from(path_display),
+        ]
     };
     frame.render_widget(
         Paragraph::new(title)
@@ -514,14 +528,14 @@ pub(super) fn draw_analyze(frame: &mut Frame<'_>, state: &mut AnalyzeState) {
         chunks[0],
     );
 
-    if state.scan.is_some() {
+    if !has_data && !complete && error.is_none() {
         let spinner = ["⠋", "⠙", "⠹", "⠸"][state.spinner];
         frame.render_widget(
             Paragraph::new(format!("\n  {spinner} Scanning disk usage..."))
                 .block(Block::default().title(" Files ").borders(Borders::ALL)),
             chunks[1],
         );
-    } else if let Some(error) = &state.scan_error {
+    } else if let Some(error) = &error {
         frame.render_widget(
             Paragraph::new(format!("\n  Scan failed: {error}"))
                 .style(Style::default().fg(Color::Red))

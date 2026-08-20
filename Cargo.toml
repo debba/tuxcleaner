@@ -27,6 +27,7 @@ self-replace = "1.5"
 tar = "0.4"
 thiserror = "2.0"
 tempfile = "3.20"
+rayon = "1.10"
 ureq = { version = "3.3", features = ["json"] }
 walkdir = "2.5"
 
