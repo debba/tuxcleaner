@@ -249,6 +249,31 @@ pub(super) fn status_lines(report: &SystemStatus) -> Vec<String> {
             disk.used_percent
         )
     }));
+    if let Some(database) = &report.package_database {
+        lines.push(String::new());
+        lines.push("Package database".into());
+        lines.push(format!(
+            "  {:<20} {} entries",
+            database.path, database.entry_count
+        ));
+        if database.transaction_in_progress {
+            lines.push("  A package transaction is running right now.".into());
+        }
+        if database.is_healthy() {
+            lines.push("  All entries have readable metadata.".into());
+        } else {
+            lines.push(format!(
+                "  {} entries have unreadable metadata. Reinstall them to repair.",
+                database.damaged_entries.len()
+            ));
+            lines.extend(
+                database
+                    .damaged_entries
+                    .iter()
+                    .map(|entry| format!("    {entry}")),
+            );
+        }
+    }
     lines
 }
 

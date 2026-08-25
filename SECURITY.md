@@ -24,6 +24,8 @@ Filesystem removal is limited to known cache paths, individually selected large 
 
 Docker cleanup uses `docker system prune -f` without `--volumes`. TuxCleaner does not enumerate or remove Docker volumes.
 
+Package cache cleanup is refused while a package transaction is running. A transaction installs archives straight out of the package caches, so emptying them mid-upgrade can fail the upgrade and leave the package database half written. On Arch systems the check is the presence of `/var/lib/pacman/db.lck`, which pacman creates for the duration of a transaction and removes afterwards. The apt and dnf lock files are permanent and held with `flock`, so their existence proves nothing and they are not used as a signal.
+
 Large personal files found by `analyze` remain read-only unless `--remove` is passed. Interactive removal starts with an empty per-file selection and requires a final confirmation. Non-interactive removal requires both `--yes` and exact `--file` paths that appear in the current analysis. Hidden application data is never eligible.
 
 ## Application uninstall trust boundary

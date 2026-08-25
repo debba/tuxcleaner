@@ -23,7 +23,7 @@ The split supports three goals:
 | `purge` | Discovery of old reproducible project artifacts |
 | `executor` | Exact path and command validation, removal, and process execution |
 | `history` | Lock-serialized JSONL operation records with bounded rotation and tolerant reads |
-| `status` | Read-only Linux health information from `/proc` and `df` |
+| `status` | Read-only Linux health information from `/proc`, `df`, and the local package database |
 | `update` | GitHub release discovery, SHA-256 verification, and atomic self-replacement |
 
 ## Adding a distribution
