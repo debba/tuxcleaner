@@ -20,6 +20,7 @@ The [VHS tour](docs/tuxcleaner-demo.tape) runs the compiled CLI against isolated
 - Disk analysis with individually selectable large personal files, separated from hidden application data
 - Old project artifact discovery for `node_modules`, `target`, `build`, `dist`, `.build`, and `.venv`
 - Read-only CPU, memory, disk, load, and uptime status
+- Package database integrity reporting, so entries damaged by an interrupted transaction are found before the next upgrade fails
 - JSON output for automation
 - Dry-run support and lock-serialized, size-bounded JSONL operation history
 - Checksum-verified self-updates from GitHub Releases

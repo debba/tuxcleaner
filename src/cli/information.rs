@@ -32,6 +32,29 @@ pub(super) fn run_status(args: StatusArgs) -> Result<()> {
                 disk.filesystem
             );
         }
+        if let Some(database) = &report.package_database {
+            println!();
+            println!(
+                "Package database: {} entries at {}",
+                database.entry_count, database.path
+            );
+            if database.transaction_in_progress {
+                println!("  A package transaction is running right now.");
+            }
+            if database.is_healthy() {
+                println!("  All entries have readable metadata.");
+            } else {
+                println!(
+                    "  {} entries have unreadable metadata, usually left behind by an",
+                    database.damaged_entries.len()
+                );
+                println!("  interrupted transaction or an unclean shutdown:");
+                for entry in &database.damaged_entries {
+                    println!("    {entry}");
+                }
+                println!("  Reinstall these packages to rebuild their metadata.");
+            }
+        }
     }
     Ok(())
 }

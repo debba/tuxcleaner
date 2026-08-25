@@ -6,6 +6,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{CleanupAction, CleanupGroup, CleanupItem, CommandSpec, Risk};
 
+/// Directory holding one metadata entry per installed package.
+///
+/// Only pacman is covered for now. The dpkg and rpm databases are single files
+/// rather than per-package directories, so they need a different integrity
+/// check and are reported as unsupported instead of guessed at.
+pub const PACMAN_LOCAL_DATABASE: &str = "/var/lib/pacman/local";
+
+/// Lock file pacman creates for the duration of a transaction and removes
+/// afterwards, so its presence is a reliable "transaction in progress" signal.
+///
+/// The apt and dnf equivalents are permanent files locked with `flock`, so
+/// existence alone proves nothing about them and they are not checked here.
+pub const PACMAN_TRANSACTION_LOCK: &str = "/var/lib/pacman/db.lck";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DistroFamily {
@@ -81,6 +95,23 @@ impl Distribution {
         };
 
         Self { id, name, family }
+    }
+
+    /// Path of the package database whose integrity `status` can verify, when
+    /// the distribution ships one this tool knows how to inspect.
+    pub fn package_database_path(&self) -> Option<&'static str> {
+        match self.family {
+            DistroFamily::Arch => Some(PACMAN_LOCAL_DATABASE),
+            DistroFamily::Debian | DistroFamily::Fedora | DistroFamily::Unsupported => None,
+        }
+    }
+
+    /// Path whose existence means a package transaction is running right now.
+    pub fn package_transaction_lock_path(&self) -> Option<&'static str> {
+        match self.family {
+            DistroFamily::Arch => Some(PACMAN_TRANSACTION_LOCK),
+            DistroFamily::Debian | DistroFamily::Fedora | DistroFamily::Unsupported => None,
+        }
     }
 
     pub fn package_cache_paths(&self) -> &'static [&'static str] {

@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 
+use crate::distro::PACMAN_TRANSACTION_LOCK;
 use crate::model::{ActionResult, CleanupAction, CleanupItem};
 use crate::uninstall::{
     Application, ApplicationSource, UninstallPreview, is_protected_package, is_valid_identifier,
@@ -16,6 +17,11 @@ pub enum ExecutionError {
     Symlink(PathBuf),
     #[error("cleanup command is not allowed: {program} {args}")]
     UnsafeCommand { program: String, args: String },
+    #[error(
+        "a package transaction is in progress ({0}); rerun once it finishes so package archives \
+         stay available to it"
+    )]
+    PackageTransactionInProgress(PathBuf),
     #[error("I/O error while processing {path}: {source}")]
     Io {
         path: PathBuf,
@@ -53,24 +59,84 @@ impl CommandRunner for ProcessCommandRunner {
 pub struct Executor<R = ProcessCommandRunner> {
     home: PathBuf,
     runner: R,
+    transaction_locks: Vec<PathBuf>,
 }
 
 impl Executor<ProcessCommandRunner> {
     pub fn new(home: PathBuf) -> Self {
-        Self {
-            home,
-            runner: ProcessCommandRunner,
-        }
+        Self::with_runner(home, ProcessCommandRunner)
     }
 }
 
 impl<R: CommandRunner> Executor<R> {
     pub fn with_runner(home: PathBuf, runner: R) -> Self {
-        Self { home, runner }
+        Self {
+            home,
+            runner,
+            transaction_locks: vec![PathBuf::from(PACMAN_TRANSACTION_LOCK)],
+        }
+    }
+
+    /// Overrides the lock files that mark a package transaction as running.
+    pub fn with_transaction_locks(mut self, locks: Vec<PathBuf>) -> Self {
+        self.transaction_locks = locks;
+        self
+    }
+
+    /// Refuses cleanups that would pull package archives or cache state out
+    /// from under a running transaction.
+    ///
+    /// A transaction reads the archives it installs straight from the package
+    /// caches, so emptying them mid-upgrade turns a routine cleanup into a
+    /// failed upgrade, and a package database left half written.
+    fn ensure_no_package_transaction(&self, action: &CleanupAction) -> Result<(), ExecutionError> {
+        if !self.touches_package_manager_state(action) {
+            return Ok(());
+        }
+        match self
+            .transaction_locks
+            .iter()
+            .find(|lock| lock.exists())
+            .cloned()
+        {
+            Some(lock) => Err(ExecutionError::PackageTransactionInProgress(lock)),
+            None => Ok(()),
+        }
+    }
+
+    fn touches_package_manager_state(&self, action: &CleanupAction) -> bool {
+        match action {
+            CleanupAction::Command { program, .. } => is_package_manager_program(program),
+            CleanupAction::CommandSequence { commands } => commands
+                .iter()
+                .any(|command| is_package_manager_program(&command.program)),
+            CleanupAction::RemovePath { path, .. } => path
+                .strip_prefix(&self.home)
+                .is_ok_and(|relative| PACKAGE_BUILD_CACHES.contains(&&*relative.to_string_lossy())),
+            CleanupAction::RemovePersonalFile { .. } => false,
+        }
     }
 
     pub fn execute(&self, item: &CleanupItem, dry_run: bool) -> ActionResult {
-        let outcome = match &item.action {
+        let outcome = match self.ensure_no_package_transaction(&item.action) {
+            Err(error) => Err(error.to_string()),
+            Ok(()) => self.execute_action(&item.action, dry_run),
+        };
+
+        ActionResult {
+            item_id: item.id.clone(),
+            label: item.label.clone(),
+            success: outcome.is_ok(),
+            dry_run,
+            estimated_bytes: item.estimated_bytes,
+            message: outcome
+                .map(|()| "completed".into())
+                .unwrap_or_else(|message| message),
+        }
+    }
+
+    fn execute_action(&self, action: &CleanupAction, dry_run: bool) -> Result<(), String> {
+        match action {
             CleanupAction::RemovePath {
                 path,
                 contents_only,
@@ -112,17 +178,6 @@ impl<R: CommandRunner> Executor<R> {
                     )
                 })
             }
-        };
-
-        ActionResult {
-            item_id: item.id.clone(),
-            label: item.label.clone(),
-            success: outcome.is_ok(),
-            dry_run,
-            estimated_bytes: item.estimated_bytes,
-            message: outcome
-                .map(|()| "completed".into())
-                .unwrap_or_else(|message| message),
         }
     }
 
@@ -415,6 +470,14 @@ fn remove_entry(path: &Path) -> Result<(), ExecutionError> {
     })
 }
 
+/// Home-relative caches where AUR helpers keep the built package archives a
+/// pacman transaction installs from.
+const PACKAGE_BUILD_CACHES: &[&str] = &[".cache/yay", ".cache/paru"];
+
+fn is_package_manager_program(program: &str) -> bool {
+    matches!(program, "pacman" | "paccache" | "apt-get" | "dnf")
+}
+
 fn is_allowed_command(program: &str, args: &[String], requires_root: bool) -> bool {
     let values: Vec<&str> = args.iter().map(String::as_str).collect();
     if matches!(
@@ -564,7 +627,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::model::{CleanupGroup, Risk};
+    use crate::model::{CleanupGroup, CommandSpec, Risk};
     use tempfile::tempdir;
 
     struct SuccessfulRunner;
@@ -615,6 +678,104 @@ mod tests {
                 .validate_path(Path::new("/home/tester/Documents"))
                 .is_err()
         );
+    }
+
+    fn paccache_item() -> CleanupItem {
+        CleanupItem {
+            id: "packages.arch.paccache".into(),
+            group: CleanupGroup::System,
+            label: "old package versions".into(),
+            estimated_bytes: 1,
+            risk: Risk::Elevated,
+            action: CleanupAction::CommandSequence {
+                commands: vec![CommandSpec {
+                    program: "paccache".into(),
+                    args: vec!["-rk1".into()],
+                    requires_root: true,
+                }],
+            },
+        }
+    }
+
+    fn build_cache_item(path: PathBuf) -> CleanupItem {
+        CleanupItem {
+            id: "user.cache.yay".into(),
+            group: CleanupGroup::User,
+            label: "yay build cache".into(),
+            estimated_bytes: 1,
+            risk: Risk::Low,
+            action: CleanupAction::RemovePath {
+                path,
+                contents_only: true,
+            },
+        }
+    }
+
+    #[test]
+    fn refuses_package_cache_cleanup_while_a_transaction_runs() {
+        let root = tempdir().unwrap();
+        let lock = root.path().join("db.lck");
+        fs::write(&lock, b"").unwrap();
+        let executor = Executor::with_runner(root.path().to_path_buf(), SuccessfulRunner)
+            .with_transaction_locks(vec![lock]);
+
+        let result = executor.execute(&paccache_item(), false);
+
+        assert!(!result.success);
+        assert!(
+            result
+                .message
+                .contains("package transaction is in progress"),
+            "{}",
+            result.message
+        );
+    }
+
+    #[test]
+    fn refuses_build_cache_removal_while_a_transaction_runs() {
+        let root = tempdir().unwrap();
+        let lock = root.path().join("db.lck");
+        fs::write(&lock, b"").unwrap();
+        let cache = root.path().join(".cache/yay");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("package.pkg.tar.zst"), b"data").unwrap();
+        let executor = Executor::with_runner(root.path().to_path_buf(), SuccessfulRunner)
+            .with_transaction_locks(vec![lock]);
+
+        let result = executor.execute(&build_cache_item(cache.clone()), false);
+
+        assert!(!result.success);
+        assert!(
+            cache.join("package.pkg.tar.zst").exists(),
+            "the archive a running transaction may still install from was removed"
+        );
+    }
+
+    #[test]
+    fn allows_package_cache_cleanup_once_the_lock_is_gone() {
+        let root = tempdir().unwrap();
+        let executor = Executor::with_runner(root.path().to_path_buf(), SuccessfulRunner)
+            .with_transaction_locks(vec![root.path().join("db.lck")]);
+
+        let result = executor.execute(&paccache_item(), false);
+
+        assert!(result.success, "{}", result.message);
+    }
+
+    #[test]
+    fn unrelated_cleanups_run_during_a_transaction() {
+        let root = tempdir().unwrap();
+        let lock = root.path().join("db.lck");
+        fs::write(&lock, b"").unwrap();
+        let target = root.path().join("project/target");
+        fs::create_dir_all(&target).unwrap();
+        let executor = Executor::with_runner(root.path().to_path_buf(), SuccessfulRunner)
+            .with_transaction_locks(vec![lock]);
+
+        let result = executor.execute(&item(target.clone()), false);
+
+        assert!(result.success, "{}", result.message);
+        assert!(!target.exists());
     }
 
     #[test]

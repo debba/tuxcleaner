@@ -1,8 +1,11 @@
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::distro::Distribution;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryStatus {
@@ -22,6 +25,26 @@ pub struct DiskStatus {
     pub used_percent: f64,
 }
 
+/// Integrity of the local package database, which a package manager rewrites
+/// during every transaction and can therefore be left half written by an
+/// interrupted upgrade or an unclean shutdown.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackageDatabaseStatus {
+    pub path: String,
+    pub entry_count: usize,
+    /// Entries whose metadata is unreadable, named as they appear on disk
+    /// (`<package>-<version>-<release>`).
+    pub damaged_entries: Vec<String>,
+    /// A package transaction was running while this snapshot was taken.
+    pub transaction_in_progress: bool,
+}
+
+impl PackageDatabaseStatus {
+    pub fn is_healthy(&self) -> bool {
+        self.damaged_entries.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemStatus {
     pub hostname: String,
@@ -30,6 +53,9 @@ pub struct SystemStatus {
     pub uptime_seconds: u64,
     pub memory: MemoryStatus,
     pub disks: Vec<DiskStatus>,
+    /// Absent when the distribution has no package database this tool knows
+    /// how to inspect, or when the database could not be read.
+    pub package_database: Option<PackageDatabaseStatus>,
 }
 
 pub fn collect() -> Result<SystemStatus> {
@@ -42,6 +68,49 @@ pub fn collect() -> Result<SystemStatus> {
         uptime_seconds: read_uptime()?,
         memory: read_memory()?,
         disks: read_disks()?,
+        package_database: read_package_database(),
+    })
+}
+
+fn read_package_database() -> Option<PackageDatabaseStatus> {
+    let distro = Distribution::detect().ok()?;
+    let database = distro.package_database_path()?;
+    let lock = distro.package_transaction_lock_path().map(Path::new);
+    inspect_package_database(Path::new(database), lock).ok()
+}
+
+/// Reports entries whose `desc` file is missing or empty.
+///
+/// `desc` is the only metadata file every valid entry must have content in.
+/// `files` and `mtree` are legitimately empty for meta packages such as `base`
+/// or `base-devel`, which own no files, so treating those as damage would
+/// report healthy systems as broken.
+pub fn inspect_package_database(
+    database: &Path,
+    lock: Option<&Path>,
+) -> Result<PackageDatabaseStatus> {
+    let entries =
+        fs::read_dir(database).with_context(|| format!("failed to read {}", database.display()))?;
+    let mut entry_count = 0;
+    let mut damaged_entries = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("failed to read {}", database.display()))?;
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        entry_count += 1;
+        let description = entry.path().join("desc");
+        let readable = fs::metadata(&description).is_ok_and(|metadata| metadata.len() > 0);
+        if !readable {
+            damaged_entries.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    damaged_entries.sort();
+    Ok(PackageDatabaseStatus {
+        path: database.display().to_string(),
+        entry_count,
+        damaged_entries,
+        transaction_in_progress: lock.is_some_and(Path::exists),
     })
 }
 
@@ -143,5 +212,66 @@ mod tests {
     fn percentage_handles_zero_total() {
         assert_eq!(percentage(10, 0), 0.0);
         assert_eq!(percentage(1, 4), 25.0);
+    }
+
+    fn write_entry(database: &Path, name: &str, description: &str, files: &str) {
+        let entry = database.join(name);
+        fs::create_dir_all(&entry).expect("entry directory");
+        fs::write(entry.join("desc"), description).expect("desc");
+        fs::write(entry.join("files"), files).expect("files");
+    }
+
+    #[test]
+    fn reports_entries_with_empty_metadata_as_damaged() {
+        let temp = tempfile::tempdir().expect("temporary database");
+        let database = temp.path();
+        write_entry(
+            database,
+            "bash-5.3.15-1",
+            "%NAME%\nbash\n",
+            "%FILES%\nusr/bin/bash\n",
+        );
+        write_entry(database, "zen-browser-bin-1.21.14b-1", "", "");
+
+        let status = inspect_package_database(database, None).expect("inspection");
+
+        assert_eq!(status.entry_count, 2);
+        assert_eq!(status.damaged_entries, vec!["zen-browser-bin-1.21.14b-1"]);
+        assert!(!status.is_healthy());
+        assert!(!status.transaction_in_progress);
+    }
+
+    #[test]
+    fn meta_packages_without_files_stay_healthy() {
+        let temp = tempfile::tempdir().expect("temporary database");
+        let database = temp.path();
+        // base owns no files, so an empty `files` entry is normal for it.
+        write_entry(database, "base-3-2", "%NAME%\nbase\n", "");
+        write_entry(database, "base-devel-1-2", "%NAME%\nbase-devel\n", "");
+
+        let status = inspect_package_database(database, None).expect("inspection");
+
+        assert_eq!(status.entry_count, 2);
+        assert!(status.damaged_entries.is_empty());
+        assert!(status.is_healthy());
+    }
+
+    #[test]
+    fn detects_a_running_transaction_from_the_lock_file() {
+        let temp = tempfile::tempdir().expect("temporary database");
+        let lock = temp.path().join("db.lck");
+
+        let idle = inspect_package_database(temp.path(), Some(&lock)).expect("inspection");
+        assert!(!idle.transaction_in_progress);
+
+        fs::write(&lock, "").expect("lock");
+        let busy = inspect_package_database(temp.path(), Some(&lock)).expect("inspection");
+        assert!(busy.transaction_in_progress);
+    }
+
+    #[test]
+    fn missing_database_is_an_error_rather_than_a_clean_bill_of_health() {
+        let temp = tempfile::tempdir().expect("temporary database");
+        assert!(inspect_package_database(&temp.path().join("absent"), None).is_err());
     }
 }
