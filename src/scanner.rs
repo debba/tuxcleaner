@@ -2,10 +2,12 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
-use walkdir::WalkDir;
+use rayon::prelude::*;
 
+use crate::analyze::parallel_dir_size;
 use crate::distro::{Distribution, DistroFamily};
 use crate::model::{CleanupAction, CleanupGroup, CleanupItem, Risk, ScanReport};
 
@@ -129,16 +131,26 @@ impl Scanner {
         group: CleanupGroup,
         items: &mut Vec<CleanupItem>,
     ) {
-        for (relative, label) in definitions {
-            let path = self.home.join(relative);
-            let estimated_bytes = dir_size(&path);
+        // Size every known path in parallel; `par_iter().map(..).collect()` preserves the
+        // original `definitions` order, so the resulting items keep the exact same order as
+        // the previous sequential loop.
+        let sized: Vec<(PathBuf, &str, u64)> = definitions
+            .par_iter()
+            .map(|(relative, label)| {
+                let path = self.home.join(relative);
+                let estimated_bytes = dir_size(&path);
+                (path, *label, estimated_bytes)
+            })
+            .collect();
+
+        for ((relative, _), (path, label, estimated_bytes)) in definitions.iter().zip(sized) {
             if estimated_bytes == 0 {
                 continue;
             }
             items.push(CleanupItem {
                 id: format!("{}.{}", group_slug(group), relative.replace('/', ".")),
                 group,
-                label: (*label).into(),
+                label: label.into(),
                 estimated_bytes,
                 risk: Risk::Low,
                 action: CleanupAction::RemovePath {
@@ -223,20 +235,7 @@ pub fn command_exists(program: &str) -> bool {
 }
 
 pub fn dir_size(path: &Path) -> u64 {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return 0;
-    };
-    if metadata.file_type().is_symlink() || metadata.is_file() {
-        return metadata.len();
-    }
-    WalkDir::new(path)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.metadata().ok())
-        .filter(|metadata| metadata.is_file())
-        .map(|metadata| metadata.len())
-        .sum()
+    parallel_dir_size(path, &AtomicBool::new(false))
 }
 
 pub fn summarize_by_group(items: &[CleanupItem]) -> HashMap<CleanupGroup, u64> {
